@@ -1,36 +1,60 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# 途灵 TripGen
 
-## Getting Started
+AI 旅行规划器：填写目的地 / 天数 / 预算 / 人群 / 偏好 → 先预选酒店 → 流式生成逐日行程 → 地图按天查看 → 对话修改 → 历史记录 → 分享 / 导出图片。生成后自动联网核验地点。
 
-First, run the development server:
+## 项目结构
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+```
+frontend/   Vue 3 + Vite + TypeScript + Tailwind v4 + Pinia + vue-router + Leaflet
+server/     Express + Vercel AI SDK + DeepSeek（独立后端）
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+- 前端端口：开发 5173，生产预览 **5174**
+- 后端端口：**3001**
+- 前端的 `/api` 由 Vite proxy 转发到 `http://localhost:3001`
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## 快速开始
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. 配置后端密钥：在 `server/.env` 写入
 
-## Learn More
+```
+DEEPSEEK_API_KEY=your_key
+```
 
-To learn more about Next.js, take a look at the following resources:
+2. 启动后端
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```bash
+cd server
+npm install
+npm run dev
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+3. 启动前端
 
-## Deploy on Vercel
+```bash
+cd frontend
+npm install
+npm run dev          # 开发，http://localhost:5173
+# 或生产预览
+npm run build
+npm run preview      # http://localhost:5174
+```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## 接口
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+| 接口 | 说明 |
+|---|---|
+| `POST /api/hotels` | 推荐 3–5 家酒店（generateObject） |
+| `POST /api/plan` | 生成/修改行程（streamObject）；body 同时含 `plan` + `messages` 时为对话修改 |
+| `POST /api/verify` | OpenStreetMap Nominatim 联网核验地点（坐标/地址/营业时间），无需 Key |
+
+## 数据存储
+
+- 历史记录：`localStorage`（键 `tripgen:history`）
+- 当前行程 / 对话：`sessionStorage`
+- 无数据库、无服务端持久化
+
+## 说明
+
+- 行程内容、酒店推荐由 DeepSeek 生成；联网核验只补齐真实 POI 的坐标与地址，价格/营业时间仍建议出行前复核。
+- `server/.env` 已被 git 忽略，请勿提交密钥。
