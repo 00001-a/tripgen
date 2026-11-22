@@ -98,6 +98,21 @@ export const PlanSchema = z.object({
 
 export type Plan = z.infer<typeof PlanSchema>;
 
+// 联网核验未通过的地点（用于工具反馈修正）
+export const PlanIssueSchema = z.object({
+  day: z.number().int(),
+  index: z.number().int(),
+  title: z.string(),
+  reason: z.string(),
+});
+export type PlanIssue = z.infer<typeof PlanIssueSchema>;
+
+export const CorrectRequestSchema = z.object({
+  // 当前行程可能含模型产出的非标准值，这里宽松校验，输出仍由 PlanSchema 约束
+  plan: z.any(),
+  issues: z.array(PlanIssueSchema).min(1).max(20),
+});
+
 // 对话消息
 export const ChatMessageSchema = z.object({
   role: z.enum(['user', 'assistant']),

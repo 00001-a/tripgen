@@ -9,6 +9,7 @@ import {
   PlanRequestSchema,
   PlanRefineRequestSchema,
   HotelListSchema,
+  CorrectRequestSchema,
 } from './schema.js';
 import {
   SYSTEM_PROMPT,
@@ -17,6 +18,8 @@ import {
   buildRefinePrompt,
   HOTEL_SYSTEM_PROMPT,
   buildHotelPrompt,
+  CORRECT_SYSTEM_PROMPT,
+  buildCorrectPrompt,
 } from './prompt.js';
 import { verifyItems } from './verify.js';
 
@@ -158,6 +161,30 @@ app.post('/api/verify', async (req, res) => {
     res.json(out);
   } catch (e) {
     res.status(500).json({ error: '联网核验失败', detail: String((e as Error)?.message ?? e) });
+  }
+});
+
+// 工具反馈修正：把联网核验未通过的地点回传给模型，返回修正后的完整行程
+app.post('/api/correct', async (req, res) => {
+  if (!process.env.DEEPSEEK_API_KEY) {
+    res.status(500).json(NO_KEY);
+    return;
+  }
+  const parsed = CorrectRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: '修正请求校验失败', issues: parsed.error.issues });
+    return;
+  }
+  try {
+    const result = await generateObject({
+      model: deepseek('deepseek-chat'),
+      schema: PlanSchema,
+      system: CORRECT_SYSTEM_PROMPT,
+      prompt: buildCorrectPrompt(parsed.data.plan, parsed.data.issues),
+    });
+    res.json(result.object);
+  } catch (e) {
+    res.status(500).json({ error: '自动修正失败', detail: String((e as Error)?.message ?? e) });
   }
 });
 

@@ -1,4 +1,4 @@
-import type { PlanRequest, ChatMessage, ChosenHotel } from './schema.js';
+import type { PlanRequest, ChatMessage, ChosenHotel, PlanIssue } from './schema.js';
 
 export const SYSTEM_PROMPT = `你是「途灵」资深旅行规划师。根据用户约束生成真实可行、节奏合理的逐日行程。
 硬性规则：
@@ -97,6 +97,32 @@ ${JSON.stringify(plan, null, 2)}
 ${history}
 
 请根据最新需求修改行程，返回完整更新后的 JSON（沿用 schema），并在 reply 字段说明本次调整。`;
+}
+
+// 联网核验后的自动修正：只替换未通过核验的地点
+export const CORRECT_SYSTEM_PROMPT = `你是「途灵」行程修正智能体，负责在“联网核验”之后修正行程中无法确认真实存在、或名称/坐标不一致的地点。
+你会收到当前完整行程 JSON 与「未通过核验的地点清单」（含 day、index、title、原因）。
+
+硬性规则：
+1. 只修改清单中列出的 item；其余内容、天数、时间结构、顺序原样保留。
+2. 被修正的 item 必须替换为同一城市内真实存在、名称明确、可被地图核验的 POI；类型与原 item 尽量一致（观光换观光、美食换美食、自然换自然）。
+3. 新 item 必须补齐 description、cost、tips，并给出尽量准确的 WGS84 坐标（lat/lng 数字）。
+4. 预算总额与 budgetBreakdown 六项之和保持不变；若替换导致某类花费变化，在同类别内微调。
+5. 保持原有约束：N 天 N−1 晚；仅前 N−1 天以住宿结尾；最后一天以返程结束；同天行程顺路。
+6. 返回完整的行程 JSON（与输入同一 schema）；在 reply 字段用一句话说明修正了哪些地点。
+7. 不要编造不存在的地点；确实找不到合适替代时，保留原标题，但在 description 末尾注明“以现场为准”。`;
+
+export function buildCorrectPrompt(plan: unknown, issues: PlanIssue[]): string {
+  const list = issues
+    .map((it, i) => `${i + 1}. Day ${it.day} 第 ${it.index + 1} 站「${it.title}」：${it.reason}`)
+    .join('\n');
+  return `当前行程 JSON：
+${JSON.stringify(plan, null, 2)}
+
+未通过联网核验的地点清单（day/index 对应 days[day-1].items[index]）：
+${list}
+
+请只修正上述地点，输出修正后的完整行程 JSON。`;
 }
 
 // 酒店推荐：在生成行程前，根据目的地与约束给出若干合适酒店供用户挑选

@@ -28,6 +28,22 @@ export interface VerifyResult {
   provider?: string;
 }
 
+// 智能体执行轨迹的一步（生成 / 核验 / 修正 / 复核）
+export interface AgentStep {
+  key: string;
+  label: string;
+  status: 'running' | 'done' | 'failed';
+  detail?: string;
+}
+
+// 工具反馈：联网核验未通过的地点，回传给模型修正
+export interface PlanIssue {
+  day: number;
+  index: number;
+  title: string;
+  reason: string;
+}
+
 export interface HistoryEntry {
   id: string;
   title: string;
@@ -133,6 +149,21 @@ export const useTripStore = defineStore('trip', () => {
   let verifySeq = 0;
   const verifiedCount = computed(() => Object.keys(verifications.value).length);
 
+  // ---------- 智能体闭环 ----------
+  const agentTrace = ref<AgentStep[]>([]);
+  const isCorrecting = ref(false);
+  const correctionError = ref<string | null>(null);
+
+  function setStep(key: string, label: string, status: AgentStep['status'], detail?: string) {
+    const rest = agentTrace.value.filter((s) => s.key !== key);
+    agentTrace.value = [...rest, { key, label, status, detail }];
+  }
+
+  function resetTrace() {
+    agentTrace.value = [];
+    correctionError.value = null;
+  }
+
   // 旧版本只把行程存进 sessionStorage，这里迁移到历史记录，避免“以前做的行程消失”
   migrateLegacyPlan();
 
@@ -149,6 +180,12 @@ export const useTripStore = defineStore('trip', () => {
         } catch {
           // 忽略存储失败（无痕模式等）
         }
+        setStep(
+          'generate',
+          pendingMode === 'refine' ? '对话修改' : '生成行程',
+          'done',
+          `${object.days.length} 天 · ${object.days.reduce((n, d) => n + d.items.length, 0)} 项`,
+        );
         upsertPlanToHistory(object);
         void verifyPlan(object);
       }
@@ -172,6 +209,8 @@ export const useTripStore = defineStore('trip', () => {
   });
 
   // ---------- 动作 ----------
+  let pendingMode: 'generate' | 'refine' = 'generate';
+
   function togglePref(v: string) {
     const idx = preferences.value.indexOf(v);
     if (idx >= 0) {
@@ -259,6 +298,8 @@ export const useTripStore = defineStore('trip', () => {
     verifyError.value = null;
     isVerifying.value = false;
     verifySeq++;
+    resetTrace();
+    isCorrecting.value = false;
     clear();
     try {
       sessionStorage.removeItem(STORAGE_PLAN);
@@ -284,6 +325,12 @@ export const useTripStore = defineStore('trip', () => {
       return;
     }
     chosenHotel.value = h;
+    pendingMode = 'generate';
+    resetTrace();
+    setStep('generate', '生成行程', 'running', '正在规划逐日路线…');
+    verifications.value = {};
+    verifyError.value = null;
+    verifySeq++;
     submit({ ...lastRequest.value, hotel: h });
   }
 
@@ -302,6 +349,10 @@ export const useTripStore = defineStore('trip', () => {
     verifications.value = {};
     verifyError.value = null;
     verifySeq++;
+    pendingMode = 'refine';
+    resetTrace();
+    setStep('generate', '对话修改', 'running', '正在按新需求更新行程…');
+    isCorrecting.value = false;
     submit({ plan: plan.value, messages: nextMessages });
   }
 
@@ -439,6 +490,8 @@ export const useTripStore = defineStore('trip', () => {
     verifications.value = entry.verify ?? {};
     verifyError.value = null;
     verifySeq++;
+    resetTrace();
+    isCorrecting.value = false;
     try {
       sessionStorage.setItem(STORAGE_PLAN, JSON.stringify(entry.plan));
     } catch {
@@ -446,7 +499,7 @@ export const useTripStore = defineStore('trip', () => {
     }
   }
 
-  async function verifyPlan(p: Plan) {
+  async function verifyPlan(p: Plan, opts?: { allowCorrect?: boolean; reverify?: boolean }) {
     if (!p?.days?.length) return;
     const items: { id: string; title: string; location: string; category: string }[] = [];
     p.days.forEach((d) => {
@@ -457,10 +510,13 @@ export const useTripStore = defineStore('trip', () => {
     });
     if (!items.length) return;
 
+    const stepKey = opts?.reverify ? 'reverify' : 'verify';
+    const label = opts?.reverify ? '修正后复核' : '联网核验';
     const seq = ++verifySeq;
     isVerifying.value = true;
     verifyError.value = null;
     verifyTotal.value = items.length;
+    setStep(stepKey, label, 'running', `${items.length} 个地点`);
 
     try {
       const res = await fetch('/api/verify', {
@@ -475,6 +531,7 @@ export const useTripStore = defineStore('trip', () => {
       if (seq !== verifySeq) return;
       if (data?.error) {
         verifyError.value = String(data.error);
+        setStep(stepKey, label, 'failed', '接口返回错误');
         return;
       }
       const map: Record<string, VerifyResult> = {};
@@ -483,6 +540,8 @@ export const useTripStore = defineStore('trip', () => {
       }
       verifications.value = map;
       verifyProvider.value = String(data?.provider ?? 'osm');
+      setStep(stepKey, label, 'done', `${Object.keys(map).length}/${items.length} 通过`);
+
       const entry = currentPlanId.value
         ? history.value.find((h) => h.id === currentPlanId.value)
         : undefined;
@@ -490,10 +549,75 @@ export const useTripStore = defineStore('trip', () => {
         entry.verify = map;
         persistHistory(history.value);
       }
+
+      // 工具反馈：未通过核验的地点回传给模型修正（只做一轮，避免死循环）
+      const issues: PlanIssue[] = items
+        .filter((it) => !map[it.id])
+        .map((it) => {
+          const [dayStr, idxStr] = it.id.split('-');
+          return {
+            day: Number(dayStr),
+            index: Number(idxStr),
+            title: it.title,
+            reason: 'OpenStreetMap 未匹配到该地点',
+          };
+        });
+      if (issues.length && opts?.allowCorrect !== false) {
+        await correctPlan(p, issues);
+      }
     } catch {
-      if (seq === verifySeq) verifyError.value = '联网核验失败，请稍后重试';
+      if (seq === verifySeq) {
+        verifyError.value = '联网核验失败，请稍后重试';
+        setStep(stepKey, label, 'failed', '请求失败');
+      }
     } finally {
       if (seq === verifySeq) isVerifying.value = false;
+    }
+  }
+
+  async function correctPlan(p: Plan, issues: PlanIssue[]) {
+    if (isCorrecting.value) return;
+    isCorrecting.value = true;
+    correctionError.value = null;
+    setStep('correct', '工具反馈修正', 'running', `${issues.length} 个地点未通过核验`);
+
+    try {
+      const res = await fetch('/api/correct', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ plan: p, issues }),
+      });
+      const data = await res.json();
+      if (!Array.isArray(data?.days)) {
+        throw new Error(String(data?.error ?? '修正接口返回异常'));
+      }
+      const corrected = data as Plan;
+      // 用修正后的行程替换当前展示（清空流式对象，plan 改为读 restoredPlan）
+      restoredPlan.value = corrected;
+      clear();
+      try {
+        sessionStorage.setItem(STORAGE_PLAN, JSON.stringify(corrected));
+      } catch {
+        // ignore
+      }
+      const entry = currentPlanId.value
+        ? history.value.find((h) => h.id === currentPlanId.value)
+        : undefined;
+      if (entry) {
+        entry.plan = corrected;
+        entry.title = corrected.title;
+        entry.updatedAt = Date.now();
+        persistHistory(history.value);
+      }
+      setStep('correct', '工具反馈修正', 'done', `已修正 ${issues.length} 个地点`);
+
+      // 修正后再核验一次，确认新地点可匹配
+      await verifyPlan(corrected, { allowCorrect: false, reverify: true });
+    } catch (e) {
+      correctionError.value = '自动修正失败，已保留原行程';
+      setStep('correct', '工具反馈修正', 'failed', String((e as Error)?.message ?? e));
+    } finally {
+      isCorrecting.value = false;
     }
   }
 
@@ -555,6 +679,9 @@ export const useTripStore = defineStore('trip', () => {
     verifyProvider,
     verifyTotal,
     verifiedCount,
+    agentTrace,
+    isCorrecting,
+    correctionError,
     // 动作
     togglePref,
     submitForm,

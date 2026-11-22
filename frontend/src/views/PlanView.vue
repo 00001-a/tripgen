@@ -127,13 +127,30 @@ function toggleCls(active: boolean) {
 
           <p v-if="trip.shareHint" class="break-all text-xs text-muted">{{ trip.shareHint }}</p>
 
-          <p v-if="trip.isVerifying" class="text-xs text-muted">
-            正在联网核验地点信息…（{{ trip.verifyTotal }} 个地点）
-          </p>
-          <p v-else-if="trip.verifyError" class="text-xs text-[#7c3a30]">{{ trip.verifyError }}</p>
-          <p v-else-if="trip.verifiedCount" class="text-xs text-brand">
-            已联网核验 {{ trip.verifiedCount }} 个地点 · OpenStreetMap
-          </p>
+          <!-- 智能体执行轨迹：生成 → 联网核验 → 工具反馈修正 → 复核 -->
+          <div v-if="trip.agentTrace.length" class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+            <span
+              v-for="s in trip.agentTrace"
+              :key="s.key"
+              class="inline-flex items-center gap-1.5"
+            >
+              <span
+                class="h-1.5 w-1.5 rounded-full"
+                :class="
+                  s.status === 'done'
+                    ? 'bg-brand'
+                    : s.status === 'running'
+                      ? 'bg-[#b08a3e] animate-pulse'
+                      : 'bg-[#9a5b4f]'
+                "
+              />
+              <span :class="s.status === 'failed' ? 'text-[#7c3a30]' : 'text-ink'">{{ s.label }}</span>
+              <span v-if="s.detail" class="text-muted">· {{ s.detail }}</span>
+            </span>
+          </div>
+
+          <p v-if="trip.verifyError" class="text-xs text-[#7c3a30]">{{ trip.verifyError }}</p>
+          <p v-if="trip.correctionError" class="text-xs text-[#7c3a30]">{{ trip.correctionError }}</p>
 
           <!-- 内容 + 对话 -->
           <div class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_300px]">
