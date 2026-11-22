@@ -39,6 +39,11 @@ export function buildUserPrompt(r: PlanRequest, hotel?: ChosenHotel | null): str
 饮食/忌口：${dietary}
 节奏：${PACE_LABEL[r.pace]}`;
 
+  if (r.hotelRequirement) {
+    base += `
+额外要求（用户原文）：${r.hotelRequirement}`;
+  }
+
   if (hotel) {
     base += `
 
@@ -105,7 +110,7 @@ export function buildHotelPrompt(r: PlanRequest): string {
 总预算：${r.budget.total} ${r.budget.currency}
 出行人群：${TYPE_LABEL[r.travelers.type]}（成人 ${r.travelers.adults}，儿童 ${r.travelers.children}）
 兴趣偏好：${prefs}
-节奏：${PACE_LABEL[r.pace]}
+节奏：${PACE_LABEL[r.pace]}${r.hotelRequirement ? `\n额外要求：${r.hotelRequirement}` : ''}
 
 请直接返回符合 schema 的 JSON。`;
 }

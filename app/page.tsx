@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import dynamic from 'next/dynamic';
 import { useObject } from '@ai-sdk/react';
 import { PlanSchema, CATEGORY_META, type PlanRequest, type ChatMessage, type Plan, type HotelCandidate, type ChosenHotel } from '@/lib/schema';
@@ -39,6 +39,39 @@ const PACE_OPTIONS = [
 
 const BUDGET_COLORS = ['#6366f1', '#f59e0b', '#10b981', '#ef4444', '#ec4899', '#06b6d4'];
 
+// ---- 分享链接（URL hash 零配置方案）----
+// 把行程 JSON 编码进地址栏 #plan= 片段，打开链接即可只读还原，无需后端存储。
+// 行程含中文，必须走 UTF-8 安全的 base64。
+function encodePlanToHash(plan: object): string {
+  const json = JSON.stringify(plan);
+  const bytes = new TextEncoder().encode(json);
+  let bin = '';
+  bytes.forEach((b) => (bin += String.fromCharCode(b)));
+  return btoa(bin);
+}
+
+function decodePlanFromHash(encoded: string): Plan | null {
+  try {
+    const bin = atob(encoded);
+    const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+    const json = new TextDecoder().decode(bytes);
+    return JSON.parse(json) as Plan;
+  } catch {
+    return null;
+  }
+}
+
+function readPlanFromHash(): Plan | null {
+  if (typeof window === 'undefined') return null;
+  const m = window.location.hash.match(/[#&]plan=([^&]+)/);
+  if (!m) return null;
+  return decodePlanFromHash(decodeURIComponent(m[1]));
+}
+
+// 会话级持久化 key：刷新页面后恢复行程与对话
+const STORAGE_PLAN = 'tripgen:plan';
+const STORAGE_CHAT = 'tripgen:chat';
+
 export default function Home() {
   const [destination, setDestination] = useState('日本东京');
   const [days, setDays] = useState(5);
@@ -51,6 +84,7 @@ export default function Home() {
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
+  const [chatHint, setChatHint] = useState<string | null>(null);
   const [view, setView] = useState<'list' | 'map'>('list');
 
   // 生成前的酒店挑选流程
@@ -59,6 +93,7 @@ export default function Home() {
   const [chosenHotel, setChosenHotel] = useState<ChosenHotel | null>(null);
   const [isLoadingHotels, setIsLoadingHotels] = useState(false);
   const [hotelError, setHotelError] = useState<string | null>(null);
+  const [hotelReqInput, setHotelReqInput] = useState('');
 
   const { object, submit, isLoading, error } = useObject({
     api: '/api/plan',
@@ -68,8 +103,57 @@ export default function Home() {
       if (object?.reply) {
         setMessages((m) => [...m, { role: 'assistant', content: object.reply as string }]);
       }
+      // 存下最终行程，页面刷新后可恢复，避免移动端刷新丢失整个会话
+      if (object) {
+        try {
+          sessionStorage.setItem(STORAGE_PLAN, JSON.stringify(object));
+        } catch {
+          // sessionStorage 不可用时忽略
+        }
+      }
     },
   });
+
+  // 挂载后从 sessionStorage 恢复行程与对话（不在首屏渲染中读取，避免 SSR 水合不一致）
+  const [restoredPlan, setRestoredPlan] = useState<Plan | null>(null);
+  const [shareCopied, setShareCopied] = useState(false);
+  const [isSharedView, setIsSharedView] = useState(false);
+  const resultRef = useRef<HTMLDivElement>(null);
+  const [isExporting, setIsExporting] = useState(false);
+  useEffect(() => {
+    try {
+      // 优先：地址栏里带 #plan= 说明是别人分享的链接，直接还原展示
+      const shared = readPlanFromHash();
+      if (shared) {
+        setRestoredPlan(shared);
+        setIsSharedView(true);
+        return;
+      }
+      const savedPlan = sessionStorage.getItem(STORAGE_PLAN);
+      if (savedPlan) setRestoredPlan(JSON.parse(savedPlan));
+      const savedChat = sessionStorage.getItem(STORAGE_CHAT);
+      if (savedChat) setMessages(JSON.parse(savedChat));
+    } catch {
+      // 恢复失败（数据损坏等）时静默忽略
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(STORAGE_CHAT, JSON.stringify(messages));
+    } catch {
+      // sessionStorage 不可用时忽略
+    }
+  }, [messages]);
+
+  // 展示/对话用行程：优先用流式生成中的 object，刷新后回退到恢复的行程
+  const plan = object ?? restoredPlan;
+
+  // 人均每晚房价：按本次出行总人数（成人 + 儿童）折算，至少按 1 人避免除零
+  const hotelPeople = Math.max(
+    (lastRequest?.travelers.adults ?? adults) + (lastRequest?.travelers.children ?? children),
+    1,
+  );
 
   function togglePref(v: string) {
     setPreferences((p) => (p.includes(v) ? p.filter((x) => x !== v) : [...p, v]));
@@ -88,11 +172,29 @@ export default function Home() {
     setLastRequest(payload);
     setMessages([]);
     setChosenHotel(null);
+    setHotelReqInput('');
+    // 开始新生成时清掉旧行程的本地缓存
+    setRestoredPlan(null);
+    setIsSharedView(false);
+    setShareCopied(false);
+    try {
+      sessionStorage.removeItem(STORAGE_PLAN);
+    } catch {
+      // sessionStorage 不可用时忽略
+    }
+    // 清掉地址栏里的分享片段，避免刷新后又跳回别人的行程
+    if (typeof window !== 'undefined' && window.location.hash) {
+      history.replaceState(null, '', window.location.pathname + window.location.search);
+    }
+
+    // 先让用户挑选酒店，再据此生成以酒店为锚点的顺路行程
+    fetchHotels(payload);
+  }
+
+  function fetchHotels(payload: PlanRequest) {
     setHotels(null);
     setHotelError(null);
     setIsLoadingHotels(true);
-
-    // 先让用户挑选酒店，再据此生成以酒店为锚点的顺路行程
     fetch('/api/hotels', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -117,8 +219,23 @@ export default function Home() {
       });
   }
 
+  // 选酒店阶段也能输入要求：带着要求重新推荐酒店（要求会一并用于后续行程生成）
+  function handleHotelRequirement(e: React.FormEvent) {
+    e.preventDefault();
+    const text = hotelReqInput.trim();
+    if (!text || !lastRequest || isLoadingHotels) return;
+    const nextRequest: PlanRequest = { ...lastRequest, hotelRequirement: text };
+    setLastRequest(nextRequest);
+    fetchHotels(nextRequest);
+  }
+
   function chooseHotel(h: HotelCandidate) {
-    if (!lastRequest) return;
+    if (!lastRequest) {
+      // 页面刷新会重置内存状态，此时酒店卡片不应再展示；给出提示引导重新生成
+      setHotelError('页面状态已重置，请重新点击「生成行程」');
+      setHotels(null);
+      return;
+    }
     setChosenHotel(h);
     submit({ ...lastRequest, hotel: h });
   }
@@ -126,15 +243,86 @@ export default function Home() {
   function handleChatSubmit(e: React.FormEvent) {
     e.preventDefault();
     const text = chatInput.trim();
-    if (!text || isLoading || !object) return;
+    if (!text || isLoading) return;
+    if (!plan) {
+      setChatHint('还没有行程可调整，请先点击「生成行程」生成一份行程');
+      return;
+    }
     const nextMessages: ChatMessage[] = [...messages, { role: 'user', content: text }];
     setMessages(nextMessages);
     setChatInput('');
+    setChatHint(null);
     // 把当前行程 + 完整对话历史发给后端，流式返回更新后的完整行程
-    submit({ plan: object, messages: nextMessages });
+    submit({ plan, messages: nextMessages });
   }
 
-  const budget = object?.budgetBreakdown;
+  // 生成「可分享链接」：把当前行程编码进地址栏片段，复制完整 URL 给朋友
+  function handleShare() {
+    if (!plan) return;
+    const encoded = encodePlanToHash(plan);
+    const url = `${window.location.origin}/#plan=${encodeURIComponent(encoded)}`;
+    // 链接过长时多数浏览器仍可用，但稳妥起见给出提示
+    if (url.length > 60000) {
+      window.prompt('行程较大，链接可能偏长，可手动复制：', url);
+      return;
+    }
+    navigator.clipboard
+      .writeText(url)
+      .then(() => setShareCopied(true))
+      .catch(() => {
+        // 剪贴板被禁用时退化为弹窗手动复制
+        window.prompt('复制下面的分享链接：', url);
+      });
+    window.setTimeout(() => setShareCopied(false), 4000);
+  }
+
+  // 把行程区域截成 PNG：截图前临时隐藏「按钮行/视图切换」并切到列表视图，截完还原
+  async function handleDownloadImage() {
+    if (!plan || !resultRef.current || isExporting) return;
+    setIsExporting(true);
+    const prevView = view;
+    try {
+      if (prevView !== 'list') {
+        setView('list');
+        // 等 React 重渲染出列表内容
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      if (resultRef.current && document.fonts?.ready) {
+        try {
+          await document.fonts.ready;
+        } catch {
+          // 字体等待失败不阻断导出
+        }
+      }
+      // 动态加载，避免 SSR 阶段引入浏览器专属代码
+      const { toPng } = await import('html-to-image');
+      const dataUrl = await toPng(resultRef.current as HTMLDivElement, {
+        pixelRatio: 2,
+        backgroundColor: '#ffffff',
+        cacheBust: true,
+        // 隐藏带 data-no-export 的节点（按钮、视图切换条），保证导出图干净
+        filter: (node) =>
+          !(
+            node instanceof HTMLElement &&
+            node.dataset?.noExport === 'true'
+          ),
+      });
+      const safeTitle = (plan.title ?? 'tripgen').replace(/[\\/:*?"<>|]/g, '');
+      const a = document.createElement('a');
+      a.href = dataUrl;
+      a.download = `途灵行程-${safeTitle}.png`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (err) {
+      window.alert('导出图片失败，请重试：' + String((err as Error)?.message ?? err));
+    } finally {
+      if (prevView !== 'list') setView(prevView);
+      setIsExporting(false);
+    }
+  }
+
+  const budget = plan?.budgetBreakdown;
   const budgetTotalActual = budget
     ? Object.values(budget).reduce((a, b) => a + b, 0)
     : 0;
@@ -229,6 +417,25 @@ export default function Home() {
               </div>
             )}
 
+            {isSharedView && (
+              <div className="mb-4 rounded-xl bg-indigo-50 p-3 text-sm text-indigo-700">
+                这是别人分享给你的行程。想自己做一份？点左侧「生成行程」即可，下面还能直接对话微调。
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (typeof window !== 'undefined' && window.location.hash) {
+                      history.replaceState(null, '', window.location.pathname + window.location.search);
+                    }
+                    setIsSharedView(false);
+                    setRestoredPlan(null);
+                  }}
+                  className="ml-2 font-semibold underline"
+                >
+                  清除分享态
+                </button>
+              </div>
+            )}
+
             {/* 酒店挑选阶段（生成行程之前） */}
             {isLoadingHotels && (
               <div className="flex h-full min-h-[300px] flex-col items-center justify-center text-center text-indigo-500">
@@ -243,21 +450,38 @@ export default function Home() {
               </div>
             )}
 
-            {hotels && !isLoadingHotels && !object && (
+            {hotels && !isLoadingHotels && !plan && (
               <div className="space-y-3">
                 <p className="text-sm font-medium text-gray-600">
-                  为你找到 {hotels.length} 家合适酒店，选一家作为每天行程的落脚点：
+                  为你找到 {hotels.length} 家合适酒店（价格按 {hotelPeople} 人分摊），选一家作为每天行程的落脚点：
                 </p>
+                <form onSubmit={handleHotelRequirement} className="flex gap-2">
+                  <input
+                    value={hotelReqInput}
+                    onChange={(e) => setHotelReqInput(e.target.value)}
+                    placeholder="对酒店还有要求？如：离地铁站近、要亲子房"
+                    className="flex-1 rounded-xl border border-gray-200 px-3 py-2 text-sm outline-none focus:border-indigo-400"
+                  />
+                  <button
+                    type="submit"
+                    disabled={isLoadingHotels || !hotelReqInput.trim()}
+                    className="rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-2 text-sm font-medium text-indigo-700 transition hover:bg-indigo-100 disabled:opacity-50"
+                  >
+                    按此重新推荐
+                  </button>
+                </form>
                 <div className="grid gap-3 sm:grid-cols-2">
                   {hotels.map((h, i) => (
                     <div key={i} className="flex flex-col rounded-2xl border border-gray-100 p-4">
                       <div className="flex items-start justify-between gap-2">
                         <span className="font-semibold text-gray-800">{h.name}</span>
                         <span className="shrink-0 rounded-md bg-indigo-50 px-2 py-0.5 text-xs font-semibold text-indigo-700">
-                          ¥{h.pricePerNight}/晚
+                          ¥{Math.round(h.pricePerNight / hotelPeople)}/人·晚
                         </span>
                       </div>
-                      <p className="mt-1 text-xs text-gray-400">{h.location}</p>
+                      <p className="mt-1 text-xs text-gray-400">
+                        {h.location} · 整间 ¥{h.pricePerNight}/晚
+                      </p>
                       <div className="mt-2 flex flex-wrap gap-1">
                         {h.tags.map((t, ti) => (
                           <span key={ti} className="rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-600">
@@ -280,29 +504,51 @@ export default function Home() {
               </div>
             )}
 
-            {!object && !isLoading && !isLoadingHotels && !hotels && !hotelError && (
+            {!plan && !isLoading && !isLoadingHotels && !hotels && !hotelError && (
               <div className="flex h-full min-h-[300px] flex-col items-center justify-center text-center text-gray-400">
                 <div className="text-6xl">🗺️</div>
                 <p className="mt-3">填写左边表单，点击「生成行程」试试看</p>
               </div>
             )}
 
-            {isLoading && !object && (
+            {isLoading && !plan && (
               <div className="flex h-full min-h-[300px] items-center justify-center text-indigo-500">
                 <span className="animate-pulse">途灵正在为你规划…</span>
               </div>
             )}
 
-            {object && (
-              <div className="space-y-5">
+            {plan && (
+              <div ref={resultRef} className="space-y-5">
                 <div>
-                  <h2 className="text-2xl font-bold text-gray-800">{object.title ?? '行程标题…'}</h2>
-                  <p className="mt-1 text-sm text-gray-500">{object.summary ?? ''}</p>
+                  <h2 className="text-2xl font-bold text-gray-800">{plan.title ?? '行程标题…'}</h2>
+                  <p className="mt-1 text-sm text-gray-500">{plan.summary ?? ''}</p>
                   {chosenHotel && (
                     <p className="mt-1 inline-flex items-center gap-1 rounded-full bg-teal-50 px-3 py-1 text-xs font-medium text-teal-700">
                       🏨 落脚点：{chosenHotel.name}
                     </p>
                   )}
+                  <div data-no-export="true" className="mt-3 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleShare}
+                      className="rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-sm font-medium text-indigo-700 transition hover:bg-indigo-100"
+                    >
+                      🔗 复制分享链接
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDownloadImage}
+                      disabled={isExporting}
+                      className="rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-sm font-medium text-indigo-700 transition hover:bg-indigo-100 disabled:opacity-60"
+                    >
+                      {isExporting ? '导出中…' : '📷 存为图片'}
+                    </button>
+                    {shareCopied && (
+                      <span className="text-sm font-medium text-emerald-600">
+                        ✓ 链接已复制，发给朋友即可打开
+                      </span>
+                    )}
+                  </div>
                 </div>
 
                 {budget && (
@@ -337,7 +583,7 @@ export default function Home() {
                 )}
 
                 {/* 视图切换：行程列表 / 卡通地图 */}
-                <div className="flex gap-2">
+                <div data-no-export="true" className="flex gap-2">
                   <button
                     type="button"
                     onClick={() => setView('list')}
@@ -363,7 +609,7 @@ export default function Home() {
                 </div>
 
                 {view === 'list' ? (
-                  object.days?.map((d) => (
+                  plan.days?.map((d) => (
                     <div key={d?.day} className="rounded-2xl border border-gray-100 p-4">
                       <div className="mb-2 flex items-center gap-2">
                         <span className="rounded-full bg-indigo-100 px-3 py-1 text-sm font-semibold text-indigo-700">
@@ -413,14 +659,14 @@ export default function Home() {
                     </div>
                   ))
                 ) : (
-                  <TripMap days={object.days as Plan['days']} />
+                  <TripMap days={plan.days as Plan['days']} />
                 )}
 
-                {object.tips && object.tips.length > 0 && (
+                {plan.tips && plan.tips.length > 0 && (
                   <div className="rounded-2xl bg-amber-50 p-4 text-sm text-amber-700">
                     <div className="font-semibold">贴心提示</div>
                     <ul className="mt-1 list-disc pl-5">
-                      {object.tips.map((t, i) => (
+                      {plan.tips.map((t, i) => (
                         <li key={i}>{t}</li>
                       ))}
                     </ul>
@@ -459,19 +705,25 @@ export default function Home() {
             <form onSubmit={handleChatSubmit} className="mt-3 flex gap-2">
               <input
                 value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
-                disabled={!object || isLoading}
-                placeholder={object ? '说点什么来改行程…' : '先生成行程后再对话'}
-                className="flex-1 rounded-xl border border-gray-200 px-3 py-2 text-sm outline-none focus:border-indigo-400 disabled:bg-gray-100"
+                onChange={(e) => {
+                  setChatInput(e.target.value);
+                  if (chatHint) setChatHint(null);
+                }}
+                disabled={isLoading}
+                placeholder={plan ? '说点什么来改行程…' : '先生成行程，之后可在这里对话调整'}
+                className="flex-1 rounded-xl border border-gray-200 px-3 py-2 text-base outline-none focus:border-indigo-400 disabled:bg-gray-100"
               />
               <button
                 type="submit"
-                disabled={!object || isLoading || !chatInput.trim()}
+                disabled={isLoading || !chatInput.trim()}
                 className="rounded-xl bg-gradient-to-r from-indigo-600 to-pink-500 px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-pink-200 transition hover:opacity-95 disabled:opacity-50"
               >
                 发送
               </button>
             </form>
+            {chatHint && (
+              <p className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700">{chatHint}</p>
+            )}
           </section>
         </div>
       </div>

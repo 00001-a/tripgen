@@ -24,6 +24,8 @@ export const PlanRequestSchema = z.object({
     .default([]),
   dietary: z.array(z.string()).optional(),
   pace: z.enum(['relaxed', 'balanced', 'packed']).default('balanced'),
+  // 选酒店阶段用户额外输入的要求（影响酒店推荐与后续行程生成）
+  hotelRequirement: z.string().max(300).optional(),
   // 生成行程前由用户选定的酒店（作为每天行程的锚点）
   hotel: ChosenHotelSchema.optional(),
 });

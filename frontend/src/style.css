@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+@theme {
+  /* 编辑杂志风配色 */
+  --color-paper: #f5f2ea;
+  --color-card: #fdfbf5;
+  --color-ink: #22211d;
+  --color-muted: #6f6b61;
+  --color-line: #e3ded0;
+  --color-brand: #1f4d3b;
+  --color-brand-strong: #173b2d;
+  --color-brand-soft: #e7ede5;
+
+  /* 字体：标题宋体，正文无衬线 */
+  --font-serif: Georgia, "Songti SC", "SimSun", "Noto Serif CJK SC", serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei",
+    "Segoe UI", sans-serif;
+}
+
+@layer base {
+  body {
+    background-color: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: var(--font-serif);
+    letter-spacing: 0.01em;
+  }
+}
